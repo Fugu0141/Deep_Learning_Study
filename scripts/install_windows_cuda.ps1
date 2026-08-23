@@ -11,7 +11,7 @@ function Invoke-Checked {
     param([string]$Executable, [string[]]$CommandArguments)
     & $Executable @CommandArguments
     if ($LASTEXITCODE -ne 0) {
-        throw "Command failed with exit code $LASTEXITCODE: $Executable $CommandArguments"
+        throw "Command failed with exit code ${LASTEXITCODE}: $Executable $CommandArguments"
     }
 }
 
