@@ -5,12 +5,14 @@ import random
 import threading
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
 from torch import Tensor
 
+from .accelerators import describe_device, select_device
 from .config import ModelConfig, TrainingConfig
 from .model import TinyGPT
 from .tokenizer import BPETokenizer
@@ -30,33 +32,6 @@ class TrainingMetrics:
     sample_prediction: str = ""
     attention: list[list[float]] | None = None
     attention_tokens: list[str] | None = None
-
-
-def select_device(requested: str = "auto") -> torch.device:
-    requested = requested.lower()
-    if requested == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was selected but is not available")
-    if requested == "mps" and not (
-        getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
-    ):
-        raise RuntimeError("MPS was selected but is not available")
-    return torch.device(requested)
-
-
-def describe_device(device: torch.device) -> str:
-    if device.type == "cuda":
-        name = torch.cuda.get_device_name(device)
-        memory_gib = torch.cuda.get_device_properties(device).total_memory / 1024**3
-        return f"CUDA: {name} ({memory_gib:.1f} GiB)"
-    if device.type == "mps":
-        return "Apple Metal (MPS)"
-    return f"CPU ({torch.get_num_threads()} threads)"
 
 
 class LanguageModelTrainer:
@@ -103,6 +78,7 @@ class LanguageModelTrainer:
         ]
         fused_available = (
             self.device.type == "cuda"
+            and getattr(torch.version, "hip", None) is None
             and "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
         )
         return torch.optim.AdamW(
@@ -177,12 +153,14 @@ class LanguageModelTrainer:
     ) -> list[TrainingMetrics]:
         torch.manual_seed(self.config.seed)
         random.seed(self.config.seed)
-        if torch.cuda.is_available():
+        if self.device.type == "cuda":
             torch.cuda.manual_seed_all(self.config.seed)
+        elif self.device.type == "xpu" and hasattr(torch.xpu, "manual_seed_all"):
+            torch.xpu.manual_seed_all(self.config.seed)
         self.stop_event.clear()
         self.model.train()
         mixed_precision = self.config.use_mixed_precision and self.device.type == "cuda"
-        scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
+        scaler = torch.amp.GradScaler("cuda") if mixed_precision else None
         started = time.perf_counter()
         previous_time = started
         if on_status:
@@ -198,21 +176,28 @@ class LanguageModelTrainer:
                 group["lr"] = learning_rate
             inputs, targets = self._batch(self.train_data)
             self.optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=torch.float16,
-                enabled=mixed_precision,
-            ):
+            precision_context = (
+                torch.autocast(device_type="cuda", dtype=torch.float16)
+                if mixed_precision
+                else nullcontext()
+            )
+            with precision_context:
                 output = self.model(inputs, targets)
                 assert output.loss is not None
                 loss = output.loss
-            scaler.scale(loss).backward()
-            scaler.unscale_(self.optimizer)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(self.optimizer)
+            else:
+                loss.backward()
             gradient_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.gradient_clip
             )
-            scaler.step(self.optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                self.optimizer.step()
             self.current_step = step + 1
 
             should_report = step == 0 or self.current_step % self.config.eval_interval == 0
@@ -273,7 +258,8 @@ def load_checkpoint(
     device: str = "auto",
 ) -> tuple[TinyGPT, BPETokenizer, dict]:
     target_device = select_device(device)
-    checkpoint = torch.load(Path(path), map_location=target_device, weights_only=False)
+    # Always deserialize on CPU first so CUDA/XPU/MPS/DirectML checkpoints remain portable.
+    checkpoint = torch.load(Path(path), map_location="cpu", weights_only=False)
     if checkpoint.get("format_version") != 1:
         raise ValueError("Unsupported checkpoint format")
     tokenizer = BPETokenizer.from_dict(checkpoint["tokenizer"])

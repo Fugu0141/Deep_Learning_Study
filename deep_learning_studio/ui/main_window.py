@@ -28,10 +28,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..accelerators import (
+    accelerator_report,
+    describe_device,
+    detect_accelerators,
+    select_device,
+)
 from ..config import ModelConfig, TrainingConfig
 from ..model import TinyGPT
 from ..tokenizer import BPETokenizer
-from ..training import LanguageModelTrainer, describe_device, load_checkpoint, select_device
+from ..training import LanguageModelTrainer, load_checkpoint
 from .visualizations import ArchitectureView, AttentionHeatmap, MetricsChart
 from .workers import GenerationWorker, TrainingWorker
 
@@ -209,16 +215,19 @@ class MainWindow(QMainWindow):
         self.eval_interval_spin.setRange(1, 10000)
         self.eval_interval_spin.setValue(25)
         self.device_combo = QComboBox()
-        self.device_combo.addItems(["auto", "cpu", "cuda", "mps"])
-        self.device_combo.currentTextChanged.connect(self._refresh_device_label)
+        self._populate_accelerators()
+        self.device_combo.currentIndexChanged.connect(self._refresh_device_label)
         self.device_label = QLabel()
         self.device_label.setStyleSheet("color: #4fd1c5;")
+        self.diagnostics_button = QPushButton("GPU・アクセラレータ診断を表示")
+        self.diagnostics_button.clicked.connect(self.show_accelerator_diagnostics)
         training_layout.addRow("学習Step", self.steps_spin)
         training_layout.addRow("Batch size", self.batch_spin)
         training_layout.addRow("Learning rate", self.learning_rate_spin)
         training_layout.addRow("可視化間隔", self.eval_interval_spin)
         training_layout.addRow("演算デバイス", self.device_combo)
         training_layout.addRow("検出結果", self.device_label)
+        training_layout.addRow(self.diagnostics_button)
         right_layout.addWidget(training_group)
 
         self.start_button = QPushButton("モデルを作成して学習を開始")
@@ -383,12 +392,31 @@ class MainWindow(QMainWindow):
         self.batch_spin.setValue(batch)
 
     def _refresh_device_label(self, *_args) -> None:
+        key = self.device_combo.currentData() or "auto"
         try:
-            self.device_label.setText(
-                describe_device(select_device(self.device_combo.currentText()))
-            )
+            self.device_label.setStyleSheet("color: #4fd1c5;")
+            self.device_label.setText(describe_device(select_device(key)))
         except Exception as error:
+            self.device_label.setStyleSheet("color: #f6ad55;")
             self.device_label.setText(str(error))
+
+    def _populate_accelerators(self) -> None:
+        self.device_combo.clear()
+        self.device_combo.addItem("自動選択（推奨）", "auto")
+        for item in detect_accelerators():
+            marker = "✓" if item.available else "—"
+            self.device_combo.addItem(f"{marker} {item.label}", item.key)
+
+    def show_accelerator_diagnostics(self) -> None:
+        report = accelerator_report()
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Information)
+        message.setWindowTitle("GPU・アクセラレータ診断")
+        message.setText(
+            "PyTorchと演算デバイスの検出結果です。CUDAが利用不可の場合は「詳細を表示」を確認してください。"
+        )
+        message.setDetailedText(report)
+        message.exec()
 
     def _update_corpus_stats(self) -> None:
         text = self.corpus_editor.toPlainText()
@@ -456,7 +484,7 @@ class MainWindow(QMainWindow):
             warmup_steps=min(50, max(1, self.steps_spin.value() // 10)),
             eval_interval=self.eval_interval_spin.value(),
             eval_batches=5,
-            device=self.device_combo.currentText(),
+            device=self.device_combo.currentData() or "auto",
         )
 
     def start_training(self) -> None:

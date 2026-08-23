@@ -27,7 +27,36 @@ pip install -e .
 python -m deep_learning_studio
 ```
 
-PyTorchは実行環境に応じてCUDA/MPS/CPUを自動選択します。NVIDIA GPU向けPyTorchの導入方法は環境ごとに異なるため、必要なら [PyTorch公式インストール案内](https://pytorch.org/get-started/locally/) のコマンドで先にPyTorchを入れてください。
+### Windows + NVIDIA GPU（RTXシリーズ）
+
+通常の `pip install torch` でCUDAを含まないPyTorchが入ると、NVIDIA GPUを搭載していてもCUDAは利用できません。このプロジェクトには、CUDA版PyTorchを専用仮想環境へ導入して検証するPowerShellスクリプトがあります。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install_windows_cuda.ps1
+.venv\Scripts\python -m deep_learning_studio
+```
+
+標準では互換性を重視してCUDA 12.6版を使用します。新しいドライバー環境では `-CudaVariant cu130` または `-CudaVariant cu132` も選択できます。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install_windows_cuda.ps1 -CudaVariant cu130
+```
+
+アプリの「GPU・アクセラレータ診断を表示」では、PyTorchの種類、CUDA Runtime、GPU名、NVIDIA Driver、利用できない理由を確認できます。PyTorchは実行環境に応じて次の順で自動選択します。
+
+1. CUDA（NVIDIA）またはROCm（AMD）
+2. XPU（Intel GPU）
+3. MPS（Apple Silicon）
+4. DirectML（Windows上の各社GPU、`torch-directml`導入時）
+5. CPU
+
+NVIDIA以外では、各バックエンドに対応したPyTorchを先に導入してください。DirectMLは `pip install torch-directml` で追加でき、アプリが自動検出します。最新の正式な導入方法は [PyTorch公式インストール案内](https://pytorch.org/get-started/locally/) を参照してください。
+
+コマンドラインだけで診断することもできます。
+
+```bash
+python scripts/diagnose_accelerator.py
+```
 
 ## 最初の実験
 
