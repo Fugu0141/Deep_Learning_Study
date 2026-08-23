@@ -52,6 +52,7 @@ class GenerationWorker(QObject):
         temperature: float,
         top_k: int,
         repetition_penalty: float,
+        auto_stop: bool,
     ) -> None:
         super().__init__()
         self.model = model
@@ -61,6 +62,7 @@ class GenerationWorker(QObject):
         self.temperature = temperature
         self.top_k = top_k
         self.repetition_penalty = repetition_penalty
+        self.auto_stop = auto_stop
 
     @Slot()
     def run(self) -> None:
@@ -98,14 +100,22 @@ class GenerationWorker(QObject):
                 )
 
             generated_ids: list[int] = []
+
+            def should_stop(_all_tokens) -> bool:
+                if not self.auto_stop or len(generated_ids) < 8:
+                    return False
+                generated_text = self.tokenizer.decode(generated_ids)
+                return generated_text.endswith(("。", "！", "？", "!", "?", "\n"))
+
             output = self.model.generate(
                 prompt_tensor,
                 self.max_new_tokens,
                 temperature=self.temperature,
                 top_k=self.top_k,
                 repetition_penalty=self.repetition_penalty,
-                eos_id=self.tokenizer.eos_id,
+                eos_id=self.tokenizer.eos_id if self.auto_stop else None,
                 on_token=on_token,
+                should_stop=should_stop if self.auto_stop else None,
             )
             self.finished.emit(self.tokenizer.decode(output[0].detach().cpu().tolist()))
         except Exception:

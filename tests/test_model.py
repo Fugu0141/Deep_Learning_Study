@@ -41,6 +41,20 @@ class TinyGPTTests(unittest.TestCase):
 
         self.assertTrue(torch.all(attention[0, 0][future_mask] == 0))
 
+    def test_generation_accepts_a_natural_stop_condition(self):
+        config = ModelConfig(20, 8, 16, 4, 1, 0.0)
+        model = TinyGPT(config)
+        prompt = torch.tensor([[1]], dtype=torch.long)
+
+        output = model.generate(
+            prompt,
+            max_new_tokens=10,
+            top_k=1,
+            should_stop=lambda tokens: tokens.shape[1] >= 3,
+        )
+
+        self.assertEqual(tuple(output.shape), (1, 3))
+
 
 if __name__ == "__main__":
     unittest.main()

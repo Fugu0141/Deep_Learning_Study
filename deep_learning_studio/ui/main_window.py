@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QAction, QFont, QTextCursor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -329,6 +330,11 @@ class MainWindow(QMainWindow):
         self.max_tokens_spin = QSpinBox()
         self.max_tokens_spin.setRange(1, 1000)
         self.max_tokens_spin.setValue(120)
+        self.auto_stop_checkbox = QCheckBox("文章の終わりで自動停止")
+        self.auto_stop_checkbox.setChecked(True)
+        self.auto_stop_checkbox.setToolTip(
+            "EOS、句点、感嘆符、疑問符、改行を予測したら停止します。最大Token数は安全上の上限です。"
+        )
         self.temperature_spin = QDoubleSpinBox()
         self.temperature_spin.setRange(0.05, 2.0)
         self.temperature_spin.setValue(0.8)
@@ -340,7 +346,8 @@ class MainWindow(QMainWindow):
         self.repetition_spin.setRange(1.0, 2.0)
         self.repetition_spin.setValue(1.05)
         self.repetition_spin.setSingleStep(0.05)
-        controls_layout.addRow("生成Token数", self.max_tokens_spin)
+        controls_layout.addRow("最大Token数", self.max_tokens_spin)
+        controls_layout.addRow(self.auto_stop_checkbox)
         controls_layout.addRow("Temperature", self.temperature_spin)
         controls_layout.addRow("Top-K", self.top_k_spin)
         controls_layout.addRow("反復Penalty", self.repetition_spin)
@@ -605,6 +612,7 @@ class MainWindow(QMainWindow):
             self.temperature_spin.value(),
             min(self.top_k_spin.value(), self.tokenizer.vocab_size),
             self.repetition_spin.value(),
+            self.auto_stop_checkbox.isChecked(),
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)

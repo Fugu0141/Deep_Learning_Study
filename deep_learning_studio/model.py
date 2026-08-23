@@ -168,6 +168,7 @@ class TinyGPT(nn.Module):
         eos_id: int | None = None,
         generator: torch.Generator | None = None,
         on_token: Callable[[int, Tensor, Tensor | None, Tensor], None] | None = None,
+        should_stop: Callable[[Tensor], bool] | None = None,
     ) -> Tensor:
         if temperature <= 0:
             raise ValueError("temperature must be positive")
@@ -206,6 +207,8 @@ class TinyGPT(nn.Module):
                     probabilities[0].detach().float().cpu(),
                 )
             if eos_id is not None and torch.all(next_token == eos_id):
+                break
+            if should_stop is not None and should_stop(generated):
                 break
         self.train(was_training)
         return generated
