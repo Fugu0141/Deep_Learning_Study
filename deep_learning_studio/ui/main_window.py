@@ -457,6 +457,9 @@ class MainWindow(QMainWindow):
         self.corpus_stats.setText(f"{len(text):,}文字 / {lines:,}行")
 
     def build_tokenizer(self) -> None:
+        if self.generation_thread is not None:
+            QMessageBox.warning(self, "生成中", "文章生成が終わってから語彙を構築してください。")
+            return
         corpus = self.corpus_editor.toPlainText()
         if len(corpus.strip()) < 20:
             QMessageBox.warning(
@@ -471,6 +474,14 @@ class MainWindow(QMainWindow):
                 min_pair_frequency=self.min_frequency_spin.value(),
             )
             self.tokenizer = tokenizer
+            # Rebuilding BPE changes token IDs; invalidate the old model instead
+            # of silently applying incompatible vocabulary to trained weights.
+            self.model = None
+            self.trainer = None
+            self.continue_button.setEnabled(False)
+            self.generate_button.setEnabled(False)
+            self.save_action.setEnabled(False)
+            self.export_action.setEnabled(False)
             encoded = tokenizer.encode(corpus, add_bos=True, add_eos=True)
             ratio = len(corpus) / max(1, len(encoded))
             self.corpus_stats.setText(
@@ -783,6 +794,8 @@ class MainWindow(QMainWindow):
             self.model = model
             self.tokenizer = tokenizer
             self.trainer = None
+            self.save_action.setEnabled(False)
+            self.export_action.setEnabled(False)
             self.architecture_view.set_config(model.config)
             self.generate_button.setEnabled(True)
             self.start_button.setEnabled(False)
