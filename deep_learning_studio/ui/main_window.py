@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import traceback
 from pathlib import Path
 
@@ -125,6 +126,10 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(open_action)
         file_menu.addAction(self.save_action)
+        self.export_action = QAction("学習履歴をCSVに保存…", self)
+        self.export_action.setEnabled(False)
+        self.export_action.triggered.connect(self.export_training_history)
+        file_menu.addAction(self.export_action)
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
 
@@ -156,6 +161,17 @@ class MainWindow(QMainWindow):
         corpus_layout.addWidget(self.corpus_editor)
         corpus_layout.addWidget(self.corpus_stats)
         left_layout.addWidget(corpus_group)
+
+        probe_group = QGroupBox("日本語の習得度テスト（学習には使いません）")
+        probe_layout = QVBoxLayout(probe_group)
+        self.probe_editor = QPlainTextEdit()
+        self.probe_editor.setMaximumHeight(110)
+        self.probe_editor.setPlaceholderText(
+            "学習に使わない日本語の文章を貼り付けます。"
+            "最初の1,024文字を使って毎回同じ条件でPerplexityを測定します。"
+        )
+        probe_layout.addWidget(self.probe_editor)
+        left_layout.addWidget(probe_group)
 
         tokenizer_group = QGroupBox("BPEトークナイザー")
         tokenizer_layout = QFormLayout(tokenizer_group)
@@ -236,6 +252,14 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.start_button.clicked.connect(self.start_training)
         right_layout.addWidget(self.start_button)
+        self.continue_button = QPushButton("現在のモデルに追加学習")
+        self.continue_button.setEnabled(False)
+        self.continue_button.setToolTip(
+            "既存の重みとBPE規則を保持し、新しい文章を追加学習します。"
+            "学習Stepは今回追加する回数です。Optimizerは新しく作成します。"
+        )
+        self.continue_button.clicked.connect(self.start_continued_training)
+        right_layout.addWidget(self.continue_button)
         right_layout.addStretch()
         splitter.addWidget(left)
         splitter.addWidget(right)
@@ -267,12 +291,14 @@ class MainWindow(QMainWindow):
         self.validation_card = MetricCard("Validation Loss")
         self.perplexity_card = MetricCard("Perplexity")
         self.speed_card = MetricCard("Tokens / sec")
+        self.probe_card = MetricCard("日本語テスト PPL")
         for card in (
             self.step_card,
             self.loss_card,
             self.validation_card,
             self.perplexity_card,
             self.speed_card,
+            self.probe_card,
         ):
             cards.addWidget(card)
         layout.addLayout(cards)
@@ -495,7 +521,7 @@ class MainWindow(QMainWindow):
         )
 
     def start_training(self) -> None:
-        if self.tokenizer is None:
+        if self.tokenizer is None or self.generation_thread is not None:
             return
         try:
             model = TinyGPT(self._model_config())
@@ -504,47 +530,91 @@ class MainWindow(QMainWindow):
                 self.tokenizer,
                 self.corpus_editor.toPlainText(),
                 self._training_config(),
+                probe_text=self.probe_editor.toPlainText(),
             )
-            self.model = model
-            self.trainer = trainer
-            self.metrics_chart.clear()
-            self.attention_view.clear()
-            self.architecture_view.set_config(model.config)
-            self.training_log.clear()
-            self.training_log.appendPlainText(
-                f"Model: {model.parameter_count():,} trainable parameters"
-            )
-            self.training_log.appendPlainText(f"Device: {describe_device(trainer.device)}")
-            self.training_log.appendPlainText(
-                f"Train tokens: {len(trainer.train_data):,} / Validation tokens: "
-                f"{len(trainer.validation_data):,}"
-            )
-            self._set_training_running(True)
-            self.tabs.setCurrentWidget(self.training_tab)
-
-            thread = QThread(self)
-            worker = TrainingWorker(trainer)
-            worker.moveToThread(thread)
-            thread.started.connect(worker.run)
-            worker.metrics.connect(self._on_metrics)
-            worker.status.connect(self._on_training_status)
-            worker.error.connect(self._on_worker_error)
-            worker.finished.connect(self._on_training_finished)
-            worker.finished.connect(worker.deleteLater)
-            worker.finished.connect(thread.quit)
-            thread.finished.connect(thread.deleteLater)
-            self.training_thread = thread
-            self.training_worker = worker
-            thread.start()
+            self._launch_training(trainer, "新規学習を開始しました")
         except Exception as error:
             self._show_error("学習を開始できませんでした", error)
 
+    def start_continued_training(self) -> None:
+        if (
+            self.model is None
+            or self.tokenizer is None
+            or self.training_thread is not None
+            or self.generation_thread is not None
+        ):
+            return
+        corpus = self.corpus_editor.toPlainText()
+        if len(corpus.strip()) < 20:
+            QMessageBox.warning(self, "データ不足", "20文字以上の追加データが必要です。")
+            return
+        try:
+            # Never re-train BPE: the old model's embedding IDs must stay stable.
+            added_characters = self.tokenizer.extend_characters(corpus)
+            self.model.expand_vocabulary(self.tokenizer.vocab_size)
+            # A new optimizer is deliberate: the dataset, Step budget and
+            # embedding shape may have changed since the previous session.
+            trainer = LanguageModelTrainer(
+                self.model,
+                self.tokenizer,
+                corpus,
+                self._training_config(),
+                probe_text=self.probe_editor.toPlainText(),
+            )
+            detail = (
+                f"追加学習を開始しました（新規文字 {len(added_characters)} 字、"
+                "重みは引き継ぎ／Optimizerは初期化）"
+            )
+            self._launch_training(trainer, detail)
+        except Exception as error:
+            self._show_error("追加学習を開始できませんでした", error)
+
+    def _launch_training(self, trainer: LanguageModelTrainer, detail: str) -> None:
+        self.model = trainer.model
+        self.trainer = trainer
+        self.metrics_chart.clear()
+        self.attention_view.clear()
+        self.architecture_view.set_config(trainer.model.config)
+        self.training_log.clear()
+        self.training_log.appendPlainText(detail)
+        self.training_log.appendPlainText(
+            f"Model: {trainer.model.parameter_count():,} trainable parameters"
+        )
+        self.training_log.appendPlainText(f"Device: {describe_device(trainer.device)}")
+        self.training_log.appendPlainText(
+            f"Train tokens: {len(trainer.train_data):,} / Validation tokens: "
+            f"{len(trainer.validation_data):,}"
+        )
+        self._set_training_running(True)
+        self.tabs.setCurrentWidget(self.training_tab)
+
+        thread = QThread(self)
+        worker = TrainingWorker(trainer)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.metrics.connect(self._on_metrics)
+        worker.status.connect(self._on_training_status)
+        worker.error.connect(self._on_worker_error)
+        worker.finished.connect(self._on_training_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        self.training_thread = thread
+        self.training_worker = worker
+        thread.start()
+
     def _set_training_running(self, running: bool) -> None:
         self.start_button.setEnabled(not running and self.tokenizer is not None)
+        self.continue_button.setEnabled(
+            not running and self.model is not None and self.tokenizer is not None
+        )
+        self.corpus_editor.setReadOnly(running)
+        self.probe_editor.setReadOnly(running)
         self.build_tokenizer_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.generate_button.setEnabled(not running and self.model is not None)
         self.save_action.setEnabled(not running and self.trainer is not None)
+        self.export_action.setEnabled(not running and self.trainer is not None)
         if running:
             self.progress_bar.setValue(0)
 
@@ -564,6 +634,12 @@ class MainWindow(QMainWindow):
         self.validation_card.set_value(f"{validation:.4f}" if validation is not None else "—")
         self.perplexity_card.set_value(f"{perplexity:.2f}" if perplexity is not None else "—")
         self.speed_card.set_value(f"{metrics['tokens_per_second']:,.0f}")
+        if metrics["probe_perplexity"] is not None:
+            self.probe_card.set_value(f"{metrics['probe_perplexity']:.2f}")
+        elif metrics["probe_coverage"] is not None:
+            self.probe_card.set_value(f"文字網羅率 {metrics['probe_coverage']:.1%}")
+        else:
+            self.probe_card.set_value("未設定")
         self.progress_bar.setValue(round(step / max_steps * 1000))
         self.metrics_chart.add_point(step, metrics["train_loss"], validation)
         if metrics["attention"]:
@@ -576,10 +652,13 @@ class MainWindow(QMainWindow):
         self.training_log.appendPlainText(
             f"step {step:>6} | train {metrics['train_loss']:.4f} | "
             f"val {validation:.4f} | ppl {perplexity:.2f} | "
-            f"{metrics['tokens_per_second']:,.0f} tok/s"
+            f"{metrics['tokens_per_second']:,.0f} tok/s | "
+            f"日本語PPL {metrics['probe_perplexity'] if metrics['probe_perplexity'] is not None else '—'} | "
+            f"{metrics['elapsed_seconds']:.1f} 秒"
         )
 
     def _on_training_status(self, status: str) -> None:
+        self.training_log.appendPlainText(status)
         self.training_status.setText(status)
         self.statusBar().showMessage(status)
 
@@ -668,6 +747,31 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self._show_error("保存に失敗しました", error)
 
+    def export_training_history(self) -> None:
+        if self.trainer is None or not self.trainer.history:
+            QMessageBox.information(self, "学習履歴", "まだ出力する学習履歴がありません。")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "学習履歴をCSVで保存", "learning_history.csv", "CSV (*.csv)"
+        )
+        if not path:
+            return
+        fields = [
+            "step", "max_steps", "elapsed_seconds", "train_loss",
+            "validation_loss", "perplexity", "probe_loss",
+            "probe_perplexity", "probe_coverage", "learning_rate",
+            "gradient_norm", "tokens_per_second",
+        ]
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                for item in self.trainer.history:
+                    writer.writerow({field: getattr(item, field) for field in fields})
+            self.statusBar().showMessage(f"学習履歴を保存しました: {path}")
+        except Exception as error:
+            self._show_error("CSVの保存に失敗しました", error)
+
     def open_checkpoint(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "チェックポイントを開く", "", "PyTorch checkpoint (*.pt *.pth)"
@@ -682,6 +786,12 @@ class MainWindow(QMainWindow):
             self.architecture_view.set_config(model.config)
             self.generate_button.setEnabled(True)
             self.start_button.setEnabled(False)
+            self.continue_button.setEnabled(True)
+            self.context_spin.setValue(model.config.context_length)
+            self.embedding_combo.setCurrentText(str(model.config.embedding_dim))
+            self.layers_spin.setValue(model.config.num_layers)
+            self.heads_spin.setValue(model.config.num_heads)
+            self.dropout_spin.setValue(model.config.dropout)
             self.tabs.setCurrentWidget(self.generation_tab)
             self.statusBar().showMessage(
                 f"{Path(path).name} を読み込みました（step {checkpoint.get('step', 0)}）"
