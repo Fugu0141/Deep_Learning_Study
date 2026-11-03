@@ -30,8 +30,8 @@ class ContinuedTrainingTests(unittest.TestCase):
         )
 
     def test_continue_after_checkpoint_with_new_japanese_characters(self):
-        old_corpus = "ねこは海にいる。きょうは晴れです。\\n" * 30
-        new_corpus = "犬は森の中で遊ぶ。\\n" * 30
+        old_corpus = "ねこは海にいる。きょうは晴れです。\n" * 30
+        new_corpus = "犬は森の中で遊ぶ。\n" * 30
         tokenizer = BPETokenizer()
         tokenizer.train(old_corpus, target_vocab_size=32, min_pair_frequency=1000)
         model = TinyGPT(
@@ -82,7 +82,7 @@ class ContinuedTrainingTests(unittest.TestCase):
             self.assertEqual(final_model.config.vocab_size, final_tokenizer.vocab_size)
 
     def test_unknown_test_characters_are_not_scored_as_valid_japanese(self):
-        corpus = "ねこは海にいる。\\n" * 30
+        corpus = "ねこは海にいる。\n" * 30
         tokenizer = BPETokenizer()
         tokenizer.train(corpus, target_vocab_size=32, min_pair_frequency=1000)
         model = TinyGPT(
