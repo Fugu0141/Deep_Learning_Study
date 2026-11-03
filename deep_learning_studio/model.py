@@ -125,6 +125,34 @@ class TinyGPT(nn.Module):
             if name.endswith(("projection.weight", "network.2.weight")):
                 nn.init.normal_(parameter, mean=0.0, std=scale)
 
+    def expand_vocabulary(self, new_vocab_size: int) -> None:
+        """Grow tied input/output embeddings without losing learned token weights."""
+        old_size = self.config.vocab_size
+        if new_vocab_size < old_size:
+            raise ValueError("Shrinking a trained vocabulary is not supported")
+        if new_vocab_size == old_size:
+            return
+        old_weight = self.token_embedding.weight
+        expanded = nn.Embedding(
+            new_vocab_size,
+            self.config.embedding_dim,
+            device=old_weight.device,
+            dtype=old_weight.dtype,
+        )
+        nn.init.normal_(expanded.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            expanded.weight[:old_size].copy_(old_weight)
+        self.token_embedding = expanded
+        self.language_head = nn.Linear(
+            self.config.embedding_dim,
+            new_vocab_size,
+            bias=False,
+            device=old_weight.device,
+            dtype=old_weight.dtype,
+        )
+        self.language_head.weight = self.token_embedding.weight
+        self.config.vocab_size = new_vocab_size
+
     def forward(
         self,
         token_ids: Tensor,
