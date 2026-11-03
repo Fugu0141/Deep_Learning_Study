@@ -32,6 +32,9 @@ class TrainingMetrics:
     sample_prediction: str = ""
     attention: list[list[float]] | None = None
     attention_tokens: list[str] | None = None
+    probe_loss: float | None = None
+    probe_perplexity: float | None = None
+    probe_coverage: float | None = None
 
 
 class LanguageModelTrainer:
@@ -41,8 +44,22 @@ class LanguageModelTrainer:
         tokenizer: BPETokenizer,
         corpus: str,
         config: TrainingConfig,
+        probe_text: str = "",
     ) -> None:
         config.validate()
+        # Hold-out text is never mixed into the training or validation data.
+        # Bounding it avoids unexpectedly expensive GUI evaluations.
+        self.probe_text = probe_text[:1024]
+        self.probe_coverage: float | None = None
+        self.probe_ids: list[int] | None = None
+        if self.probe_text:
+            self.probe_coverage = sum(
+                character in tokenizer.base_characters for character in self.probe_text
+            ) / len(self.probe_text)
+            if self.probe_coverage == 1.0:
+                self.probe_ids = tokenizer.encode(
+                    self.probe_text, add_bos=True, add_eos=True
+                )
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
@@ -146,6 +163,38 @@ class LanguageModelTrainer:
             prediction,
         )
 
+    @torch.no_grad()
+    def evaluate_probe(self) -> tuple[float | None, float | None, float | None]:
+        """Next-token PPL on a fixed held-out text, independent of train/val.
+
+        OOV characters invalidate perplexity and are shown as coverage instead.
+        """
+        if self.probe_coverage is None or self.probe_ids is None:
+            return None, None, self.probe_coverage
+        was_training = self.model.training
+        self.model.eval()
+        total_loss = 0.0
+        total_tokens = 0
+        try:
+            context = self.model.config.context_length
+            for start in range(0, len(self.probe_ids) - 1, context):
+                chunk = self.probe_ids[start : start + context + 1]
+                if len(chunk) < 2:
+                    continue
+                inputs = torch.tensor([chunk[:-1]], dtype=torch.long, device=self.device)
+                targets = torch.tensor(chunk[1:], dtype=torch.long, device=self.device)
+                logits = self.model(inputs).logits[0]
+                total_loss += float(
+                    torch.nn.functional.cross_entropy(
+                        logits, targets, reduction="sum"
+                    ).detach().cpu()
+                )
+                total_tokens += len(targets)
+        finally:
+            self.model.train(was_training)
+        loss = total_loss / total_tokens
+        return loss, math.exp(min(20.0, loss)), self.probe_coverage
+
     def train(
         self,
         on_metrics: Callable[[TrainingMetrics], None] | None = None,
@@ -165,6 +214,15 @@ class LanguageModelTrainer:
         previous_time = started
         if on_status:
             on_status(f"学習開始: {describe_device(self.device)}")
+            if self.probe_coverage is not None:
+                _, baseline_ppl, coverage = self.evaluate_probe()
+                if baseline_ppl is None:
+                    on_status(
+                        f"日本語テストの文字網羅率: {coverage:.1%}。"
+                        "未登録文字があるためPPLを算出できません"
+                    )
+                else:
+                    on_status(f"学習開始前の日本語テスト PPL: {baseline_ppl:.3f}")
 
         for step in range(self.current_step, self.config.max_steps):
             if self.stop_event.is_set():
@@ -203,6 +261,7 @@ class LanguageModelTrainer:
             should_report = step == 0 or self.current_step % self.config.eval_interval == 0
             if should_report or self.current_step == self.config.max_steps:
                 validation_loss, perplexity, attention, tokens, prediction = self.evaluate()
+                probe_loss, probe_ppl, probe_coverage = self.evaluate_probe()
                 now = time.perf_counter()
                 steps_in_window = 1 if len(self.history) == 0 else self.config.eval_interval
                 tokens_per_second = (
@@ -225,6 +284,9 @@ class LanguageModelTrainer:
                     sample_prediction=prediction,
                     attention=attention,
                     attention_tokens=tokens,
+                    probe_loss=probe_loss,
+                    probe_perplexity=probe_ppl,
+                    probe_coverage=probe_coverage,
                 )
                 self.history.append(metrics)
                 if on_metrics:

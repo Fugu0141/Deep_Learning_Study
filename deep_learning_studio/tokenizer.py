@@ -124,6 +124,22 @@ class BPETokenizer:
                 index += 1
         return result
 
+    def extend_characters(self, text: str) -> list[str]:
+        """Append unseen Unicode characters without changing old token IDs or merges.
+
+        BPE merges stay frozen during continued training, avoiding changes to
+        the meanings of already learned embedding rows.
+        """
+        self._require_trained()
+        additions = sorted(set(text) - self.base_characters)
+        for character in additions:
+            if character in self.token_to_id:
+                raise ValueError(f"Character conflicts with a token: {character!r}")
+            self.token_to_id[character] = len(self.id_to_token)
+            self.id_to_token.append(character)
+            self.base_characters.add(character)
+        return additions
+
     def encode(self, text: str, *, add_bos: bool = False, add_eos: bool = False) -> list[int]:
         self._require_trained()
         pieces = [
